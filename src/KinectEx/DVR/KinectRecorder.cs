@@ -1,4 +1,6 @@
-﻿using Newtonsoft.Json;
+﻿using System.Collections.Concurrent;
+using System.Diagnostics;
+using Newtonsoft.Json;
 using System;
 using System.Collections.Generic;
 using System.IO;
@@ -22,20 +24,20 @@ namespace KinectEx.DVR
     public class KinectRecorder : IDisposable
     {
         BinaryWriter _writer;
-        SemaphoreSlim _writerSemaphore = new SemaphoreSlim(1);
-        KinectSensor _sensor;
+        readonly SemaphoreSlim _writerSemaphore = new SemaphoreSlim(1);
+        readonly KinectSensor _sensor;
 
-        ColorRecorder _colorRecorder;
-        DepthRecorder _depthRecorder;
-        BodyRecorder _bodyRecorder;
+        readonly ColorRecorder _colorRecorder;
+        readonly DepthRecorder _depthRecorder;
+        readonly BodyRecorder _bodyRecorder;
 
         ColorFrameReader _colorReader;
         DepthFrameReader _depthReader;
         BodyFrameReader _bodyReader;
 
-        bool _isStarted = false;
-        bool _isStopped = false;
-        Task _processFramesTask = null;
+        bool _isStarted;
+        bool _isStopped;
+        Task _processFramesTask;
 
         DateTime _previousFlushTime;
 
@@ -127,38 +129,20 @@ namespace KinectEx.DVR
         #endregion
 
         ////////////////////////////////////////////////////////////////////////////
-        #region Simple linked list for enqueueing and dequeueing frames
+        #region ConcurrentQueue for enqueueing and dequeueing frames
         ////////////////////////////////////////////////////////////////////////////
 
-        Object _queueMonitorObject = new Object();
-        ReplayFrame _firstFrame = null;
-        ReplayFrame _lastFrame = null;
-        int _queueSize = 0;
+        ConcurrentQueue<ReplayFrame> _framesQueue;
 
         private void EnqueFrame(ReplayFrame replayFrame)
         {
-            Monitor.Enter(_queueMonitorObject);
-            if (_firstFrame == null)
-                _firstFrame = _lastFrame = replayFrame;
-            else
-                _lastFrame.NextFrame = replayFrame;
-            _lastFrame.NextFrame = replayFrame;
-            _lastFrame = replayFrame;
-            _queueSize++;
-            Monitor.Exit(_queueMonitorObject);
+            _framesQueue.Enqueue(replayFrame);
         }
 
         private ReplayFrame DequeFrame()
         {
-            Monitor.Enter(_queueMonitorObject);
-            ReplayFrame frame = _firstFrame;
-            if (frame.NextFrame == null)
-                _firstFrame = _lastFrame = null;
-            else
-                _firstFrame = frame.NextFrame;
-            frame.NextFrame = null;
-            _queueSize--;
-            Monitor.Exit(_queueMonitorObject);
+            ReplayFrame frame;
+            _framesQueue.TryDequeue(out frame);
             return frame;
         }
 
@@ -351,7 +335,7 @@ namespace KinectEx.DVR
             if (_isStopped)
                 return;
 
-            System.Diagnostics.Debug.WriteLine(">>> StopAsync (queue size {0})", _queueSize);
+            System.Diagnostics.Debug.WriteLine(">>> StopAsync (queue size {0})", _framesQueue.Count);
 
             _isStarted = false;
             _isStopped = true;
@@ -419,7 +403,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayColorFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -436,7 +420,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayColorFrame(frame, bytes));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -451,7 +435,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayDepthFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -467,7 +451,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayDepthFrame(frame, frameData));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -482,7 +466,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayBodyFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -498,7 +482,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayBodyFrame(frame, bodies));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -514,7 +498,7 @@ namespace KinectEx.DVR
             if (frame != null)
             {
                 EnqueFrame(new ReplayBodyFrame(frame, bodies));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _queueSize);
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
             }
         }
 
@@ -560,41 +544,50 @@ namespace KinectEx.DVR
             }
         }
 
-        private async Task ProcessFramesAsync()
+        private Task ProcessFramesAsync()
         {
             _previousFlushTime = DateTime.Now;
-            await Task.Run(async () =>
+            _framesQueue = new ConcurrentQueue<ReplayFrame>();
+            var task = Task.Run(async () =>
             {
                 while (true)
                 {
-                    if (_queueSize > 0)
+                    var queueSize = _framesQueue.Count;
+                    if (queueSize > 0)
                     {
                         try
                         {
                             await _writerSemaphore.WaitAsync();
                             var frame = DequeFrame();
 
-                            if (frame is ReplayColorFrame)
+                            var colorFrame = frame as ReplayColorFrame;
+                            if (colorFrame != null)
                             {
-                                await _colorRecorder.RecordAsync((ReplayColorFrame)frame);
-                                System.Diagnostics.Debug.WriteLine("--- Processed Color Frame ({0})", _queueSize);
+                                await _colorRecorder.RecordAsync(colorFrame);
+                                Debug.WriteLine("--- Processed Color Frame ({0})", queueSize);
+                                Flush();
+                                continue;
                             }
-                            else if (frame is ReplayDepthFrame)
+                            var depthFrame = frame as ReplayDepthFrame;
+                            if (depthFrame != null)
                             {
-                                await _depthRecorder.RecordAsync((ReplayDepthFrame)frame);
-                                System.Diagnostics.Debug.WriteLine("--- Processed Depth Frame ({0})", _queueSize);
+                                await _depthRecorder.RecordAsync(depthFrame);
+                                Debug.WriteLine("--- Processed Depth Frame ({0})", queueSize);
+                                Flush();
+                                continue;
                             }
-                            else if (frame is ReplayBodyFrame)
+                            var bodyFrame = frame as ReplayBodyFrame;
+                            if (bodyFrame != null)
                             {
-                                await _bodyRecorder.RecordAsync((ReplayBodyFrame)frame);
-                                System.Diagnostics.Debug.WriteLine("--- Processed Body Frame ({0})", _queueSize);
+                                await _bodyRecorder.RecordAsync(bodyFrame);
+                                Debug.WriteLine("--- Processed Body Frame ({0})", queueSize);
+                                Flush();
                             }
-                            Flush();
                         }
                         catch (Exception ex)
                         {
                             // TODO: Change to log the error
-                            System.Diagnostics.Debug.WriteLine(ex);
+                            Debug.WriteLine(ex);
                         }
                         finally
                         {
@@ -604,13 +597,14 @@ namespace KinectEx.DVR
                     else
                     {
                         await Task.Delay(100);
-                        if (_queueSize == 0 && _isStarted == false)
+                        if (queueSize == 0 && _isStarted == false)
                         {
                             break;
                         }
                     }
                 }
-            }).ConfigureAwait(false);
+            });
+            return task;
         }
 
         private void Flush()
