@@ -177,9 +177,9 @@ namespace KinectEx
         /// <summary>
         /// Update the Bitmap from the supplied depth frame data values.
         /// </summary>
-        public async Task UpdateAsync(ushort[] data, ushort minDepth, ushort maxDepth)
+        public Task UpdateAsync(ushort[] data, ushort minDepth, ushort maxDepth)
         {
-            await Task.Run(async () =>
+            return Task.Run(async () =>
             {
                 int colorPixelIndex = 0;
                 for (int i = 0; i < data.Length; ++i)
