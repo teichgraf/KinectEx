@@ -182,9 +182,9 @@ namespace KinectEx
         /// <summary>
         /// Update the Bitmap from the supplied infrared frame data values.
         /// </summary>
-        public async Task UpdateAsync(ushort[] data)
+        public Task UpdateAsync(ushort[] data)
         {
-            await Task.Run(async () =>
+            return Task.Run(async () =>
             {
                 int colorPixelIndex = 0;
                 int dataLen = data.Length;

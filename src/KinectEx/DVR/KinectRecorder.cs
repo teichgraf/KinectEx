@@ -682,11 +682,11 @@ namespace KinectEx.DVR
             }
         }
 
-        private async Task ProcessFramesAsync()
+        private Task ProcessFramesAsync()
         {
             _previousFlushTime = DateTime.Now;
             var cancellationToken = _processFramesCancellationTokenSource.Token;
-            await Task.Run(async () =>
+            return Task.Run(async () =>
             {
                 while (true)
                 {
@@ -740,7 +740,7 @@ namespace KinectEx.DVR
                         }
                     }
                 }
-            }, cancellationToken).ConfigureAwait(false);
+            }, cancellationToken);
         }
 
         private void Flush()

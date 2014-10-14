@@ -27,9 +27,9 @@ namespace KinectEx.DVR
         /// Records a <c>ReplayDepthFrame</c>.
         /// </summary>
         /// <param name="frame">The frame.</param>
-        public async Task RecordAsync(ReplayDepthFrame frame)
+        public Task RecordAsync(ReplayDepthFrame frame)
         {
-            await Task.Run(() =>
+            return Task.Run(() =>
             {
                 try
                 {
