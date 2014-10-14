@@ -26,7 +26,7 @@ namespace KinectEx.DVR
         private int _jpegQuality = 70;
 
         /// <summary>
-        /// Uniue ID for this <c>IColorCodec</c> instance.
+        /// Unique ID for this <c>IColorCodec</c> instance.
         /// </summary>
         public int CodecId { get { return 1; } }
 
@@ -72,6 +72,13 @@ namespace KinectEx.DVR
             get { return _jpegQuality; }
             set { _jpegQuality = value; }
         }
+
+#if !NETFX_CORE
+        /// <summary>
+        /// Gets the pixel format of the last image decoded.
+        /// </summary>
+        public PixelFormat PixelFormat { get; private set; }
+#endif
 
         /// <summary>
         /// Encodes the specified bitmap data and outputs it to the specified
@@ -184,30 +191,34 @@ namespace KinectEx.DVR
         }
 
         /// <summary>
-        /// Decodes the supplied encoded bitmap data and outputs a <c>BitmapSource</c>.
+        /// Decodes the supplied encoded bitmap data into an array of pixels.
         /// For internal use only.
         /// </summary>
-        public async Task<BitmapSource> DecodeAsync(byte[] bytes)
+        public async Task<byte[]> DecodeAsync(byte[] encodedBytes)
         {
 #if NETFX_CORE
-            BitmapDecoder dec = null;
-
             using (var ras = new InMemoryRandomAccessStream())
             {
-                await ras.AsStream().WriteAsync(bytes, 0, bytes.Length);
+                await ras.AsStream().WriteAsync(encodedBytes, 0, encodedBytes.Length);
                 ras.Seek(0);
-                dec = await BitmapDecoder.CreateAsync(BitmapDecoder.JpegDecoderId, ras);
+                var dec = await BitmapDecoder.CreateAsync(BitmapDecoder.JpegDecoderId, ras);
                 var pixelDataProvider = await dec.GetPixelDataAsync();
-                var bmp = BitmapFactory.New((int)dec.PixelWidth, (int)dec.PixelHeight).FromByteArray(pixelDataProvider.DetachPixelData());
-                return bmp;
+                return pixelDataProvider.DetachPixelData();
             }
 #else
             using (var str = new MemoryStream())
             {
-                str.Write(bytes, 0, bytes.Length);
+                str.Write(encodedBytes, 0, encodedBytes.Length);
                 str.Position = 0;
                 var dec = new JpegBitmapDecoder(str, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
-                return await Task.FromResult(dec.Frames[0]);
+                var frame = dec.Frames[0];
+                this.PixelFormat = frame.Format;
+                var bpp = frame.Format.BitsPerPixel / 8;
+                var stride = bpp * frame.PixelWidth;
+                var size = stride * frame.PixelHeight;
+                var output = new byte[size];
+                frame.CopyPixels(output, stride, 0);
+                return await Task.FromResult(output);
             }
 #endif
         }

@@ -1,7 +1,6 @@
-﻿using System.Collections.Concurrent;
-using System.Diagnostics;
-using Newtonsoft.Json;
+﻿using Newtonsoft.Json;
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
 using System.Reflection;
@@ -23,27 +22,33 @@ namespace KinectEx.DVR
     /// </summary>
     public class KinectRecorder : IDisposable
     {
-        BinaryWriter _writer;
-        readonly SemaphoreSlim _writerSemaphore = new SemaphoreSlim(1);
-        readonly KinectSensor _sensor;
+        private BinaryWriter _writer;
+        private SemaphoreSlim _writerSemaphore = new SemaphoreSlim(1);
+        private KinectSensor _sensor;
 
-        readonly ColorRecorder _colorRecorder;
-        readonly DepthRecorder _depthRecorder;
-        readonly BodyRecorder _bodyRecorder;
+        private BodyRecorder _bodyRecorder;
+        private ColorRecorder _colorRecorder;
+        private DepthRecorder _depthRecorder;
+        private InfraredRecorder _infraredRecorder;
 
-        ColorFrameReader _colorReader;
-        DepthFrameReader _depthReader;
-        BodyFrameReader _bodyReader;
+        private BodyFrameReader _bodyReader;
+        private ColorFrameReader _colorReader;
+        private DepthFrameReader _depthReader;
+        private InfraredFrameReader _infraredReader;
 
-        bool _isStarted;
-        bool _isStopped;
-        Task _processFramesTask;
+        private ConcurrentQueue<ReplayFrame> _recordQueue = new ConcurrentQueue<ReplayFrame>();
 
-        DateTime _previousFlushTime;
+        private bool _isStarted = false;
+        private bool _isStopped = false;
+        private Task _processFramesTask = null;
+        private CancellationTokenSource _processFramesCancellationTokenSource = new CancellationTokenSource();
 
+        private DateTime _previousFlushTime;
+
+        private bool _enableBodyRecorder;
         private bool _enableColorRecorder;
         private bool _enableDepthRecorder;
-        private bool _enableBodyRecorder;
+        private bool _enableInfraredRecorder;
 
         ////////////////////////////////////////////////////////////////////////////
         #region PROPERTIES
@@ -56,6 +61,22 @@ namespace KinectEx.DVR
         public bool IsStarted
         {
             get { return _isStarted; }
+        }
+
+        /// <summary>
+        /// Determines whether the KinectRecorder will record Body frames. Applies only when the
+        /// KinectRecorder is in "Automatic" mode. Cannot be changed after recording has started.
+        /// </summary>
+        public bool EnableBodyRecorder
+        {
+            get { return _enableBodyRecorder; }
+            set
+            {
+                if (_isStarted)
+                    throw new InvalidOperationException("Cannot modify recorder properties after recording has started");
+
+                _enableBodyRecorder = value;
+            }
         }
 
         /// <summary>
@@ -91,18 +112,18 @@ namespace KinectEx.DVR
         }
 
         /// <summary>
-        /// Determines whether the KinectRecorder will record Body frames. Applies only when the
+        /// Determines whether the KinectRecorder will record Infrared frames. Applies only when the
         /// KinectRecorder is in "Automatic" mode. Cannot be changed after recording has started.
         /// </summary>
-        public bool EnableBodyRecorder
+        public bool EnableInfraredRecorder
         {
-            get { return _enableBodyRecorder; }
+            get { return _enableInfraredRecorder; }
             set
             {
                 if (_isStarted)
                     throw new InvalidOperationException("Cannot modify recorder properties after recording has started");
 
-                _enableBodyRecorder = value;
+                _enableInfraredRecorder = value;
             }
         }
 
@@ -124,26 +145,6 @@ namespace KinectEx.DVR
 
                 _colorRecorder.Codec = value;
             }
-        }
-
-        #endregion
-
-        ////////////////////////////////////////////////////////////////////////////
-        #region ConcurrentQueue for enqueueing and dequeueing frames
-        ////////////////////////////////////////////////////////////////////////////
-
-        ConcurrentQueue<ReplayFrame> _framesQueue;
-
-        private void EnqueFrame(ReplayFrame replayFrame)
-        {
-            _framesQueue.Enqueue(replayFrame);
-        }
-
-        private ReplayFrame DequeFrame()
-        {
-            ReplayFrame frame;
-            _framesQueue.TryDequeue(out frame);
-            return frame;
         }
 
         #endregion
@@ -182,26 +183,44 @@ namespace KinectEx.DVR
         {
             _writer = new BinaryWriter(stream);
             _sensor = sensor;
+            _bodyRecorder = new BodyRecorder(_writer);
             _colorRecorder = new ColorRecorder(_writer);
             _depthRecorder = new DepthRecorder(_writer);
-            _bodyRecorder = new BodyRecorder(_writer);
+            _infraredRecorder = new InfraredRecorder(_writer);
         }
 
+        /// <summary>
+        /// Finalizes an instance of the <see cref="KinectRecorder"/> class.
+        /// </summary>
         ~KinectRecorder()
         {
             this.Dispose(false);
         }
 
+        /// <summary>
+        /// Performs application-defined tasks associated with freeing, releasing, or resetting unmanaged resources.
+        /// </summary>
         public void Dispose()
         {
             this.Dispose(true);
             GC.SuppressFinalize(this);
         }
 
+        /// <summary>
+        /// Releases unmanaged and - optionally - managed resources.
+        /// </summary>
+        /// <param name="disposing"><c>true</c> to release both managed and unmanaged resources; <c>false</c> to release only unmanaged resources.</param>
         protected virtual void Dispose(bool disposing)
         {
             if (disposing)
             {
+                if (_bodyReader != null)
+                {
+                    _bodyReader.FrameArrived -= _bodyReader_FrameArrived;
+                    _bodyReader.Dispose();
+                    _bodyReader = null;
+                }
+
                 if (_colorReader != null)
                 {
                     _colorReader.FrameArrived -= _colorReader_FrameArrived;
@@ -216,11 +235,11 @@ namespace KinectEx.DVR
                     _depthReader = null;
                 }
 
-                if (_bodyReader != null)
+                if (_infraredReader != null)
                 {
-                    _bodyReader.FrameArrived -= _bodyReader_FrameArrived;
-                    _bodyReader.Dispose();
-                    _bodyReader = null;
+                    _infraredReader.FrameArrived -= _infraredReader_FrameArrived;
+                    _infraredReader.Dispose();
+                    _infraredReader = null;
                 }
 
                 try
@@ -271,6 +290,12 @@ namespace KinectEx.DVR
 
             if (_sensor != null)
             {
+                if (EnableBodyRecorder)
+                {
+                    _bodyReader = _sensor.BodyFrameSource.OpenReader();
+                    _bodyReader.FrameArrived += _bodyReader_FrameArrived;
+                }
+
                 if (EnableColorRecorder)
                 {
                     _colorReader = _sensor.ColorFrameSource.OpenReader();
@@ -283,10 +308,10 @@ namespace KinectEx.DVR
                     _depthReader.FrameArrived += _depthReader_FrameArrived;
                 }
 
-                if (EnableBodyRecorder)
+                if (EnableInfraredRecorder)
                 {
-                    _bodyReader = _sensor.BodyFrameSource.OpenReader();
-                    _bodyReader.FrameArrived += _bodyReader_FrameArrived;
+                    _infraredReader = _sensor.InfraredFrameSource.OpenReader();
+                    _infraredReader.FrameArrived += _infraredReader_FrameArrived;
                 }
 
                 if (!_sensor.IsOpen)
@@ -308,8 +333,17 @@ namespace KinectEx.DVR
                 };
                 if (_sensor != null)
                 {
-                    //metadata.DepthCameraIntrinsics = _sensor.CoordinateMapper..GetDepthCameraIntrinsics();
-                    metadata.DepthFrameToCameraSpaceTable = _sensor.CoordinateMapper.GetDepthFrameToCameraSpaceTable();
+                    //metadata.DepthCameraIntrinsics = _sensor.CoordinateMapper.GetDepthCameraIntrinsics();
+                    //metadata.DepthFrameToCameraSpaceTable = _sensor.CoordinateMapper.GetDepthFrameToCameraSpaceTable();
+                }
+                else
+                {
+                    var sensor = KinectSensor.GetDefault();
+                    if (sensor != null)
+                    {
+                        //metadata.DepthCameraIntrinsics = sensor.CoordinateMapper.GetDepthCameraIntrinsics();
+                        //metadata.DepthFrameToCameraSpaceTable = sensor.CoordinateMapper.GetDepthFrameToCameraSpaceTable();
+                    }
                 }
                 _writer.Write(JsonConvert.SerializeObject(metadata));
             }
@@ -335,10 +369,17 @@ namespace KinectEx.DVR
             if (_isStopped)
                 return;
 
-            System.Diagnostics.Debug.WriteLine(">>> StopAsync (queue size {0})", _framesQueue.Count);
+            System.Diagnostics.Debug.WriteLine(">>> StopAsync (queue size {0})", _recordQueue.Count);
 
             _isStarted = false;
             _isStopped = true;
+
+            if (_bodyReader != null)
+            {
+                _bodyReader.FrameArrived -= _bodyReader_FrameArrived;
+                _bodyReader.Dispose();
+                _bodyReader = null;
+            }
 
             if (_colorReader != null)
             {
@@ -354,15 +395,367 @@ namespace KinectEx.DVR
                 _depthReader = null;
             }
 
-            if (_bodyReader != null)
+            if (_infraredReader != null)
             {
-                _bodyReader.FrameArrived -= _bodyReader_FrameArrived;
-                _bodyReader.Dispose();
-                _bodyReader = null;
+                _infraredReader.FrameArrived -= _infraredReader_FrameArrived;
+                _infraredReader.Dispose();
+                _infraredReader = null;
             }
 
-            await _processFramesTask;
+            try
+            {
+                await _processFramesTask;
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine("!!! Process Canceled (in StopAsync)");
+            }
+            _processFramesTask = null;
 
+            await CloseWriterAsync();
+
+            System.Diagnostics.Debug.WriteLine("<<< StopAsync (DONE!)");
+        }
+
+        /// <summary>
+        /// Stops the <c>KinectRecorder</c>, discards all remaining frames in the
+        /// record queue, and closes the associated stream.
+        /// </summary>
+        public async void CancelAsync()
+        {
+            if (_processFramesTask == null)
+                return;
+
+            System.Diagnostics.Debug.WriteLine(">>> CancelAsync (queue size {0})", _recordQueue.Count);
+
+            _isStarted = false;
+            _isStopped = true;
+
+            try
+            {
+                _processFramesCancellationTokenSource.Cancel();
+                await _processFramesTask;
+            }
+            catch
+            {
+                System.Diagnostics.Debug.WriteLine("--- Cancel Acknowledged");
+            }
+            _processFramesTask = null;
+
+            await CloseWriterAsync();
+
+            System.Diagnostics.Debug.WriteLine("<<< CancelAsync (DONE!)");
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>BodyFrame</c>.
+        /// </summary>
+        public void RecordFrame(BodyFrame frame)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayBodyFrame(frame));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Body in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>BodyFrame</c> if
+        /// the body frame data has already been retrieved from the frame.
+        /// </summary>
+        public void RecordFrame(BodyFrame frame, List<CustomBody> bodies)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayBodyFrame(frame, bodies));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Body in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>BodyFrame</c> if
+        /// the body frame data has already been retrieved from the frame.
+        /// </summary>
+        public void RecordFrame(BodyFrame frame, Body[] bodies)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayBodyFrame(frame, bodies));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Body in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>ColorFrame</c>.
+        /// </summary>
+        public void RecordFrame(ColorFrame frame)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayColorFrame(frame));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Color in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>ColorFrame</c> if
+        /// the color frame data has already been retrieved from the frame.
+        /// Note that the frame data must have been converted to BGRA format.
+        /// </summary>
+        public void RecordFrame(ColorFrame frame, byte[] bytes)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayColorFrame(frame, bytes));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Color in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>DepthFrame</c>.
+        /// </summary>
+        public void RecordFrame(DepthFrame frame)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayDepthFrame(frame));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Depth in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>DepthFrame</c> if
+        /// the depth frame data has already been retrieved from the frame.
+        /// </summary>
+        public void RecordFrame(DepthFrame frame, ushort[] frameData)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayDepthFrame(frame, frameData));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Depth in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>InfraredFrame</c>.
+        /// </summary>
+        public void RecordFrame(InfraredFrame frame)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayInfraredFrame(frame));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Infrared Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Infrared in KinectRecorder)");
+            }
+        }
+
+        /// <summary>
+        /// Used in "Manual" mode to record a single <c>InfraredFrame</c> if
+        /// the infrared frame data has already been retrieved from the frame.
+        /// </summary>
+        public void RecordFrame(InfraredFrame frame, ushort[] frameData)
+        {
+            if (!_isStarted)
+                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
+
+            if (frame != null)
+            {
+                _recordQueue.Enqueue(new ReplayInfraredFrame(frame, frameData));
+                System.Diagnostics.Debug.WriteLine("+++ Enqueued Infrared Frame ({0})", _recordQueue.Count);
+            }
+            else
+            {
+                System.Diagnostics.Debug.WriteLine("!!! FRAME SKIPPED (Infrared in KinectRecorder)");
+            }
+        }
+
+        #endregion
+
+        ////////////////////////////////////////////////////////////////////////////
+        #region SUPPORT CODE
+        ////////////////////////////////////////////////////////////////////////////
+
+#if NETFX_CORE
+        void _bodyReader_FrameArrived(BodyFrameReader sender, BodyFrameArrivedEventArgs args)
+#else
+        void _bodyReader_FrameArrived(object sender, BodyFrameArrivedEventArgs args)
+#endif
+        {
+            using (var frame = args.FrameReference.AcquireFrame())
+            {
+                if (_isStarted)
+                    RecordFrame(frame);
+            }
+        }
+
+#if NETFX_CORE
+        void _colorReader_FrameArrived(ColorFrameReader sender, ColorFrameArrivedEventArgs args)
+#else
+        void _colorReader_FrameArrived(object sender, ColorFrameArrivedEventArgs args)
+#endif
+        {
+            using (var frame = args.FrameReference.AcquireFrame())
+            {
+                if (_isStarted)
+                    RecordFrame(frame);
+            }
+        }
+
+#if NETFX_CORE
+        void _depthReader_FrameArrived(DepthFrameReader sender, DepthFrameArrivedEventArgs args)
+#else
+        void _depthReader_FrameArrived(object sender, DepthFrameArrivedEventArgs args)
+#endif
+        {
+            using (var frame = args.FrameReference.AcquireFrame())
+            {
+                if (_isStarted)
+                    RecordFrame(frame);
+            }
+        }
+
+#if NETFX_CORE
+        void _infraredReader_FrameArrived(InfraredFrameReader sender, InfraredFrameArrivedEventArgs args)
+#else
+        void _infraredReader_FrameArrived(object sender, InfraredFrameArrivedEventArgs args)
+#endif
+        {
+            using (var frame = args.FrameReference.AcquireFrame())
+            {
+                if (_isStarted)
+                    RecordFrame(frame);
+            }
+        }
+
+        private async Task ProcessFramesAsync()
+        {
+            _previousFlushTime = DateTime.Now;
+            var cancellationToken = _processFramesCancellationTokenSource.Token;
+            await Task.Run(async () =>
+            {
+                while (true)
+                {
+                    cancellationToken.ThrowIfCancellationRequested();
+
+                    ReplayFrame frame;
+                    if (_recordQueue.TryDequeue(out frame))
+                    {
+                        try
+                        {
+                            await _writerSemaphore.WaitAsync();
+
+                            if (frame is ReplayBodyFrame)
+                            {
+                                await _bodyRecorder.RecordAsync((ReplayBodyFrame)frame);
+                                System.Diagnostics.Debug.WriteLine("--- Processed Body Frame ({0})", _recordQueue.Count);
+                            }
+                            else if (frame is ReplayColorFrame)
+                            {
+                                await _colorRecorder.RecordAsync((ReplayColorFrame)frame);
+                                System.Diagnostics.Debug.WriteLine("--- Processed Color Frame ({0})", _recordQueue.Count);
+                            }
+                            else if (frame is ReplayDepthFrame)
+                            {
+                                await _depthRecorder.RecordAsync((ReplayDepthFrame)frame);
+                                System.Diagnostics.Debug.WriteLine("--- Processed Depth Frame ({0})", _recordQueue.Count);
+                            }
+                            else if (frame is ReplayInfraredFrame)
+                            {
+                                await _infraredRecorder.RecordAsync((ReplayInfraredFrame)frame);
+                                System.Diagnostics.Debug.WriteLine("--- Processed Infrared Frame ({0})", _recordQueue.Count);
+                            }
+                            Flush();
+                        }
+                        catch (Exception ex)
+                        {
+                            // TODO: Change to log the error
+                            System.Diagnostics.Debug.WriteLine(ex);
+                        }
+                        finally
+                        {
+                            _writerSemaphore.Release();
+                        }
+                    }
+                    else
+                    {
+                        await Task.Delay(100);
+                        if (_recordQueue.IsEmpty && _isStarted == false)
+                        {
+                            break;
+                        }
+                    }
+                }
+            }, cancellationToken).ConfigureAwait(false);
+        }
+
+        private void Flush()
+        {
+            var now = DateTime.Now;
+
+            if (now.Subtract(_previousFlushTime).TotalSeconds > 10)
+            {
+                _previousFlushTime = now;
+                _writer.Flush();
+            }
+        }
+
+        private async Task CloseWriterAsync()
+        {
             try
             {
                 await _writerSemaphore.WaitAsync();
@@ -387,234 +780,6 @@ namespace KinectEx.DVR
             finally
             {
                 _writerSemaphore.Release();
-            }
-
-            System.Diagnostics.Debug.WriteLine("<<< StopAsync (DONE!)");
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>ColorFrame</c>.
-        /// </summary>
-        public void RecordFrame(ColorFrame frame)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayColorFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>ColorFrame</c> if
-        /// the color frame data has already been retrieved from the frame.
-        /// Note that the frame data must have been converted to BGRA format.
-        /// </summary>
-        public void RecordFrame(ColorFrame frame, byte[] bytes)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayColorFrame(frame, bytes));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Color Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>DepthFrame</c>.
-        /// </summary>
-        public void RecordFrame(DepthFrame frame)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayDepthFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>DepthFrame</c> if
-        /// the depth frame data has already been retrieved from the frame.
-        /// </summary>
-        public void RecordFrame(DepthFrame frame, ushort[] frameData)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayDepthFrame(frame, frameData));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Depth Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>BodyFrame</c>.
-        /// </summary>
-        public void RecordFrame(BodyFrame frame)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayBodyFrame(frame));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>BodyFrame</c> if
-        /// the body frame data has already been retrieved from the frame.
-        /// </summary>
-        public void RecordFrame(BodyFrame frame, List<CustomBody> bodies)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayBodyFrame(frame, bodies));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        /// <summary>
-        /// Used in "Manual" mode to record a single <c>BodyFrame</c> if
-        /// the body frame data has already been retrieved from the frame.
-        /// </summary>
-        public void RecordFrame(BodyFrame frame, Body[] bodies)
-        {
-            if (!_isStarted)
-                throw new InvalidOperationException("Cannot record frames unless the KinectRecorder is started.");
-
-            if (frame != null)
-            {
-                EnqueFrame(new ReplayBodyFrame(frame, bodies));
-                System.Diagnostics.Debug.WriteLine("+++ Enqueued Body Frame ({0})", _framesQueue.Count);
-            }
-        }
-
-        #endregion
-
-        ////////////////////////////////////////////////////////////////////////////
-        #region SUPPORT CODE
-        ////////////////////////////////////////////////////////////////////////////
-
-#if NETFX_CORE
-        void _colorReader_FrameArrived(ColorFrameReader sender, ColorFrameArrivedEventArgs args)
-#else
-        void _colorReader_FrameArrived(object sender, ColorFrameArrivedEventArgs args)
-#endif
-        {
-            using (var frame = args.FrameReference.AcquireFrame())
-            {
-                RecordFrame(frame);
-            }
-        }
-
-#if NETFX_CORE
-        void _depthReader_FrameArrived(DepthFrameReader sender, DepthFrameArrivedEventArgs args)
-#else
-        void _depthReader_FrameArrived(object sender, DepthFrameArrivedEventArgs args)
-#endif
-        {
-            using (var frame = args.FrameReference.AcquireFrame())
-            {
-                RecordFrame(frame);
-            }
-        }
-
-#if NETFX_CORE
-        void _bodyReader_FrameArrived(BodyFrameReader sender, BodyFrameArrivedEventArgs args)
-#else
-        void _bodyReader_FrameArrived(object sender, BodyFrameArrivedEventArgs args)
-#endif
-        {
-            using (var frame = args.FrameReference.AcquireFrame())
-            {
-                RecordFrame(frame);
-            }
-        }
-
-        private Task ProcessFramesAsync()
-        {
-            _previousFlushTime = DateTime.Now;
-            _framesQueue = new ConcurrentQueue<ReplayFrame>();
-            var task = Task.Run(async () =>
-            {
-                while (true)
-                {
-                    var queueSize = _framesQueue.Count;
-                    if (queueSize > 0)
-                    {
-                        try
-                        {
-                            await _writerSemaphore.WaitAsync();
-                            var frame = DequeFrame();
-
-                            var colorFrame = frame as ReplayColorFrame;
-                            if (colorFrame != null)
-                            {
-                                await _colorRecorder.RecordAsync(colorFrame);
-                                Debug.WriteLine("--- Processed Color Frame ({0})", queueSize);
-                                Flush();
-                                continue;
-                            }
-                            var depthFrame = frame as ReplayDepthFrame;
-                            if (depthFrame != null)
-                            {
-                                await _depthRecorder.RecordAsync(depthFrame);
-                                Debug.WriteLine("--- Processed Depth Frame ({0})", queueSize);
-                                Flush();
-                                continue;
-                            }
-                            var bodyFrame = frame as ReplayBodyFrame;
-                            if (bodyFrame != null)
-                            {
-                                await _bodyRecorder.RecordAsync(bodyFrame);
-                                Debug.WriteLine("--- Processed Body Frame ({0})", queueSize);
-                                Flush();
-                            }
-                        }
-                        catch (Exception ex)
-                        {
-                            // TODO: Change to log the error
-                            Debug.WriteLine(ex);
-                        }
-                        finally
-                        {
-                            _writerSemaphore.Release();
-                        }
-                    }
-                    else
-                    {
-                        await Task.Delay(100);
-                        if (queueSize == 0 && _isStarted == false)
-                        {
-                            break;
-                        }
-                    }
-                }
-            });
-            return task;
-        }
-
-        private void Flush()
-        {
-            var now = DateTime.Now;
-
-            if (now.Subtract(_previousFlushTime).TotalSeconds > 10)
-            {
-                _previousFlushTime = now;
-                _writer.Flush();
             }
         }
 

@@ -1,12 +1,19 @@
 ﻿namespace KinectEx.Smoothing
 {
     /// <summary>
-    /// Contains member properties used to configure 
+    /// Contains member properties used to configure a <c>KalmanSmooter</c>.
     /// </summary>
     public class KalmanSmoothingParameters : ISmootherParameters
     {
-        public static float DEFAULT_MEASUREMENT_UNCERTAINTY = 0.001f;
-        public static float DEFAULT_JITTER_RADIUS = 0.03f;
+        /// <summary>
+        /// The default measurement uncertainty
+        /// </summary>
+        private static float DEFAULT_MEASUREMENT_UNCERTAINTY = 0.001f;
+
+        /// <summary>
+        /// The default jitter radius
+        /// </summary>
+        private static float DEFAULT_JITTER_RADIUS = 0.03f;
 
         /// <summary>
         /// The degree of "uncertainty" applied to the X, Y, and Z measurements
@@ -23,6 +30,9 @@
         /// </summary>
         public float JitterRadius { get; set; }
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="KalmanSmoothingParameters"/> class.
+        /// </summary>
         public KalmanSmoothingParameters()
         {
             MeasurementUncertainty = DEFAULT_MEASUREMENT_UNCERTAINTY;

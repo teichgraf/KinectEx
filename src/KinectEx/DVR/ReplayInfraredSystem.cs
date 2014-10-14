@@ -5,23 +5,22 @@ namespace KinectEx.DVR
 {
     /// <summary>
     /// Internal class that provides the services necessary to decode and playback
-    /// a <c>ReplayBodyFrame</c>.
+    /// a <c>ReplayInfraredFrame</c>.
     /// </summary>
-    internal class ReplayBodySystem : ReplaySystem
+    internal class ReplayInfraredSystem : ReplaySystem
     {
         /// <summary>
         /// Occurs when a new frame is ready to be displayed.
         /// </summary>
-        public event Action<ReplayBodyFrame> FrameArrived;
+        public event Action<ReplayInfraredFrame> FrameArrived;
 
         /// <summary>
         /// Adds a frame to the Frames list.
         /// </summary>
         /// <param name="reader">The reader.</param>
-        /// <param name="version">The version.</param>
-        public void AddFrame(BinaryReader reader, Version version)
+        public void AddFrame(BinaryReader reader)
         {
-            var frame = ReplayBodyFrame.FromReader(reader, version);
+            var frame = ReplayInfraredFrame.FromReader(reader);
             if (frame != null)
                 this.Frames.Add(frame);
         }
@@ -34,7 +33,7 @@ namespace KinectEx.DVR
             if (this.FrameCount == 0)
                 return;
 
-            var frame = (ReplayBodyFrame)this.Frames[CurrentFrame];
+            var frame = (ReplayInfraredFrame)this.Frames[CurrentFrame];
             if (FrameArrived != null)
                 FrameArrived(frame);
         }

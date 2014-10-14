@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Threading;
 using System.Threading.Tasks;
 
 #if NETFX_CORE
@@ -46,8 +47,7 @@ namespace KinectEx.DVR
         public int Height { get; internal set; }
 
         /// <summary>
-        /// The raw (potentially compressed) bits comprising the bitmap
-        /// contained in this frame.
+        /// The pixel data for the bitmap contained in this frame.
         /// </summary>
         public byte[] FrameData
         {
@@ -56,16 +56,7 @@ namespace KinectEx.DVR
                 if (_frameData == null)
                 {
                     // Assume we must read it from disk
-                    var bytes = new byte[FrameDataSize];
-
-                    long savedPosition = Stream.Position;
-                    Stream.Position = StreamPosition;
-
-                    Stream.Read(bytes, 0, FrameDataSize);
-
-                    Stream.Position = savedPosition;
-
-                    return bytes;
+                    return GetFrameDataAsync().Result;
                 }
                 return _frameData;
             }
@@ -74,18 +65,27 @@ namespace KinectEx.DVR
         /// <summary>
         /// Retrieve and decode the bitmap contained in this frame.
         /// </summary>
+        [Obsolete("Use a ColorFrameBitmap instead")]
         public async Task<BitmapSource> GetBitmapAsync()
         {
-            Codec.Width = this.Width;
-            Codec.Height = this.Height;
-            return await Codec.DecodeAsync(this.FrameData);
+            ColorFrameBitmap bitmap = new ColorFrameBitmap(this);
+            bitmap.Update(this);
+            return await Task.FromResult(bitmap.Bitmap);
         }
 
         // Multiple Constructor options
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ReplayColorFrame"/> class.
+        /// </summary>
         internal ReplayColorFrame() { }
 
 #if !NOSDK
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ReplayColorFrame"/> class
+        /// based on the specified <c>ColorFrame</c>.
+        /// </summary>
+        /// <param name="frame">The frame.</param>
         internal ReplayColorFrame(ColorFrame frame)
         {
             this.Codec = ColorCodecs.Raw;
@@ -109,6 +109,12 @@ namespace KinectEx.DVR
             }
         }
 
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ReplayColorFrame"/> class
+        /// based on the specified <c>ColorFrame</c> and <c>byte</c> array.
+        /// </summary>
+        /// <param name="frame">The frame.</param>
+        /// <param name="bytes">The bytes.</param>
         internal ReplayColorFrame(ColorFrame frame, byte[] bytes)
         {
             this.Codec = ColorCodecs.Raw;
@@ -124,8 +130,15 @@ namespace KinectEx.DVR
         }
 #endif
 
-        // and a factory method
-
+        /// <summary>
+        /// Initializes a new instance of the <see cref="ReplayColorFrame"/> class
+        /// by reading from the specified <c>BinaryReader</c> using the specified
+        /// <c>IColorCodec</c>.
+        /// </summary>
+        /// <param name="reader">The reader.</param>
+        /// <param name="codec">The codec.</param>
+        /// <returns>The <c>ReplayColorFrame</c></returns>
+        /// <exception cref="System.IO.IOException">The recording appears to be corrupt.</exception>
         internal static ReplayColorFrame FromReader(BinaryReader reader, IColorCodec codec)
         {
             var frame = new ReplayColorFrame();
@@ -144,18 +157,60 @@ namespace KinectEx.DVR
             frame.Stream.Position += frame.FrameDataSize;
 
             // Do Frame Integrity Check
-            if (reader.ReadString() != ReplayFrame.EndOfFrameMarker)
+            var isGoodFrame = false;
+            try
+            {
+                if (reader.ReadString() == ReplayFrame.EndOfFrameMarker)
+                {
+                    isGoodFrame = true;
+                }
+            }
+            catch { }
+
+            if (!isGoodFrame)
             {
                 System.Diagnostics.Debug.WriteLine("BAD FRAME...RESETTING");
                 reader.BaseStream.Position = frameStartPos + frame.FrameSize;
-                if (reader.ReadString() != ReplayFrame.EndOfFrameMarker)
+                
+                try
+                {
+                    if (reader.ReadString() != ReplayFrame.EndOfFrameMarker)
+                    {
+                        throw new IOException("The recording appears to be corrupt.");
+                    }
+                    return null;
+                }
+                catch
                 {
                     throw new IOException("The recording appears to be corrupt.");
                 }
-                return null;
+
             }
 
             return frame;
+        }
+
+        /// <summary>
+        /// Used during replay to retrieve the uncompressed pixel data stored on 
+        /// disk for this frame. Pixels will be in BGRA32 format.
+        /// </summary>
+        public Task<byte[]> GetFrameDataAsync()
+        {
+            return Task<byte[]>.Run(async () =>
+            {
+                Monitor.Enter(Stream);
+                var bytes = new byte[FrameDataSize];
+
+                long savedPosition = Stream.Position;
+                Stream.Position = StreamPosition;
+
+                Stream.Read(bytes, 0, FrameDataSize);
+
+                Stream.Position = savedPosition;
+                Monitor.Exit(Stream);
+
+                return await Codec.DecodeAsync(bytes);
+            });
         }
     }
 }
